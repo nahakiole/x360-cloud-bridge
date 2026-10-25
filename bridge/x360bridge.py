@@ -9,6 +9,11 @@ and publishes the state of up to 4 controllers on a local WebSocket
 standard Gamepad API controllers inside cloud-gaming pages.
 
 Wire protocol knowledge comes from the Linux kernel's xpad driver.
+
+Originally written by Maverserker (https://github.com/Maverserker/x360-cloud-bridge).
+Modified 2026-10-25 by Robin Glauser (https://github.com/nahakiole/x360-cloud-bridge):
+transient USB read errors are retried instead of resetting the receiver, the read
+timeout is longer, and a race that showed phantom controllers is fixed.
 """
 
 import argparse
@@ -28,7 +33,7 @@ import usb.core
 import usb.util
 from websockets.asyncio.server import broadcast, serve
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 VENDOR_ID = 0x045E
 PRODUCT_IDS = (0x0291, 0x0719, 0x02A9)  # Microsoft receivers and common clones
