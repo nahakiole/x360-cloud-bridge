@@ -13,6 +13,7 @@ Wire protocol knowledge comes from the Linux kernel's xpad driver.
 
 import argparse
 import asyncio
+import errno
 import json
 import logging
 import math
@@ -38,6 +39,16 @@ DEFAULT_PORT = 8360
 HEARTBEAT_SECONDS = 5      # keeps the extension's service worker alive
 MAX_RUMBLE_MS = 5000
 TRIGGER_THRESHOLD = 0.12   # analog trigger value that counts as "pressed"
+
+# Each read waits this long for a packet before trying again. On macOS every timeout
+# aborts the pending transfer, so a short timeout means constant abort churn on all
+# four endpoints; one second keeps that low while still noticing shutdown quickly.
+READ_TIMEOUT_MS = 1000
+# A failed read is retried this many times in a row (with a short, growing pause)
+# before the receiver is treated as gone. A single I/O error does not mean it was
+# unplugged: the device usually stays attached and the next read works.
+READ_RETRIES = 5
+RETRY_DELAY_S = 0.05
 
 # Browsers always send an Origin header; only the extension and local test
 # pages are allowed. Non-browser local tools (no Origin) are allowed too.
@@ -102,13 +113,15 @@ class Receiver:
     """One Xbox 360 wireless receiver, with a reader thread per controller slot."""
 
     def __init__(self, on_packet, on_lost):
-        self.on_packet = on_packet
-        self.on_lost = on_lost
+        self.on_packet = on_packet  # on_packet(slot, data, receiver)
+        self.on_lost = on_lost      # on_lost(receiver), called at most once
         self.dev = None
+        self.backend = None
         self.slots = []  # (interface_number, ep_in, ep_out)
         self.threads = []
         self.stop = threading.Event()
         self.write_lock = threading.Lock()
+        self.lost_lock = threading.Lock()
 
     @staticmethod
     def find(backend):
@@ -153,7 +166,7 @@ class Receiver:
             if e.errno == 13:
                 raise ReceiverBusy() from e
             raise
-        self.dev, self.slots = dev, slots
+        self.dev, self.slots, self.backend = dev, slots, backend
         log.info("Receiver %04x:%04x ready, %d controller slots", dev.idVendor, dev.idProduct, len(slots))
         self.stop.clear()
         for slot in range(len(slots)):
@@ -165,18 +178,52 @@ class Receiver:
 
     def _read_loop(self, slot):
         ep_in = self.slots[slot][1]
+        errors = 0
         while not self.stop.is_set():
             try:
-                data = bytes(self.dev.read(ep_in, 64, timeout=250))
+                data = bytes(self.dev.read(ep_in, 64, timeout=READ_TIMEOUT_MS))
             except usb.core.USBTimeoutError:
+                errors = 0
                 continue
             except usb.core.USBError as e:
-                if not self.stop.is_set():
-                    log.warning("Lost the receiver (%s)", e)
-                    self.stop.set()
-                    self.on_lost()
+                if self.stop.is_set():
+                    return
+                errors += 1
+                if e.errno == errno.ENODEV or errors > READ_RETRIES or not self._still_attached():
+                    self._lost(e)
+                    return
+                if errors == 1:
+                    log.info("USB read error on slot %d (%s), retrying", slot + 1, e)
+                else:
+                    log.debug("USB read error on slot %d (%s), retry %d/%d", slot + 1, e, errors, READ_RETRIES)
+                if e.errno == errno.EPIPE:  # endpoint stalled: clear it before reading again
+                    try:
+                        self.dev.clear_halt(ep_in)
+                    except usb.core.USBError:
+                        pass
+                self.stop.wait(RETRY_DELAY_S * errors)
+                continue
+            if errors:
+                log.info("Slot %d recovered after %d read error%s", slot + 1, errors, "" if errors == 1 else "s")
+                errors = 0
+            self.on_packet(slot, data, self)
+
+    def _still_attached(self):
+        """True if the same receiver is still on the bus (a read error alone does not mean it left)."""
+        try:
+            return usb.core.find(idVendor=self.dev.idVendor, idProduct=self.dev.idProduct,
+                                 bus=self.dev.bus, address=self.dev.address, backend=self.backend) is not None
+        except usb.core.USBError:
+            return False
+
+    def _lost(self, err):
+        # Several slot threads usually fail at the same moment; only the first one reports it.
+        with self.lost_lock:
+            if self.stop.is_set():
                 return
-            self.on_packet(slot, data)
+            self.stop.set()
+        log.warning("Lost the receiver (%s)", err)
+        self.on_lost(self)
 
     def send(self, slot, payload):
         if self.dev is None or slot >= len(self.slots):
@@ -196,9 +243,10 @@ class Receiver:
         self.send(slot, bytes([0x00, 0x01, 0x0F, 0xC0, 0x00, strong, weak]))
 
     def close(self):
-        self.stop.set()
+        with self.lost_lock:
+            self.stop.set()
         for t in self.threads:
-            t.join(timeout=1)
+            t.join(timeout=READ_TIMEOUT_MS / 1000 + 0.5)
         self.threads = []
         if self.dev is None:
             return
@@ -233,10 +281,16 @@ class Bridge:
 
     # ---- called from USB reader threads ----
 
-    def on_packet(self, slot, data):
+    def on_packet(self, slot, data, receiver):
         changed = False
         connected_now = None
         with self.lock:
+            # A receiver that has been given up on can still deliver a packet that was
+            # already in flight on another slot's thread. Ignoring it here, under the same
+            # lock that on_receiver_lost clears the pads with, stops it from reviving a
+            # controller ("phantom connected") after the receiver is gone.
+            if receiver.stop.is_set():
+                return
             pad = self.pads[slot]
             if len(data) >= 2 and data[0] & 0x08:  # presence change
                 present = bool(data[1] & 0x80)
@@ -256,12 +310,17 @@ class Bridge:
                 changed = changed or connected_now is not None
         if connected_now is not None:
             log.info("Controller %d %s", slot + 1, "connected" if connected_now else "disconnected")
-            if connected_now and self.receiver:
-                self.receiver.set_led(slot, 6 + slot)
+            if connected_now:
+                # the packet's own receiver: self.receiver may not be assigned yet while it opens
+                receiver.set_led(slot, 6 + slot)
         if changed:
             self.schedule_flush()
 
-    def on_receiver_lost(self):
+    def on_receiver_lost(self, receiver):
+        # receiver.stop is already set, so clearing the pads now (under the lock) is final:
+        # on_packet drops anything this receiver still delivers afterwards.
+        with self.lock:
+            self.pads = [self._empty_pad() for _ in range(MAX_SLOTS)]
         self.loop.call_soon_threadsafe(self._receiver_lost)
 
     def _receiver_lost(self):
